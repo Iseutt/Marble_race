@@ -103,7 +103,7 @@
      * Large ΔY, sustained ~22–35° effective grades, short 45°+ kinks in steep zones.
      */
     function buildPathSamples() {
-      const samples = [];
+      const inner = [];
       const STEPS = 170;
       for (let i = 0; i <= STEPS; i++) {
         const u = i / STEPS;
@@ -137,9 +137,27 @@
           x = (1 - k) * Math.sin(0.64 * Math.PI * 5) * 5.5 * 0.25;
         }
 
-        samples.push({ x, y, z, u });
+        inner.push({ x, y, z, u });
       }
-      /* Arc length + banking from horizontal curvature (centrifugal into track). */
+
+      const pA = inner[0];
+      const pB = inner[1];
+      const dn = new THREE.Vector3(pB.x - pA.x, pB.y - pA.y, pB.z - pA.z).normalize();
+      const uph = dn.clone().multiplyScalar(-1);
+      const runwayLen = 16;
+      const runwayStep = 0.75;
+      const prep = [];
+      for (let d = runwayLen; d >= runwayStep * 0.5; d -= runwayStep) {
+        prep.push({
+          x: pA.x + uph.x * d,
+          y: pA.y + uph.y * d,
+          z: pA.z + uph.z * d,
+          u: -d / 200,
+        });
+      }
+
+      const samples = prep.concat(inner);
+
       let s = 0;
       samples[0].s = 0;
       for (let i = 1; i < samples.length; i++) {
