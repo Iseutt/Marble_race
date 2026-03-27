@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Marble Race 3D</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { overflow: hidden; height: 100%; background: #0a0f18; font-family: "Segoe UI", system-ui, sans-serif; }
+    #hud {
+      position: fixed; top: 0; right: 0; width: 220px; padding: 14px 16px;
+      background: linear-gradient(180deg, rgba(15,23,42,0.92), rgba(15,23,42,0.75));
+      border-left: 2px solid rgba(148,163,184,0.35); color: #e2e8f0; z-index: 10;
+      min-height: 100vh; pointer-events: none;
+    }
+    #hud h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em; color: #94a3b8; margin-bottom: 8px; }
+    #timer { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; margin-bottom: 14px; color: #f8fafc; }
+    .row { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 13px; border-bottom: 1px solid rgba(51,65,85,0.5); }
+    .row.done { opacity: 0.7; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; box-shadow: 0 0 6px currentColor; }
+    .rank { width: 22px; font-weight: 700; color: #facc15; }
+    .cam-hint { margin-top: auto; padding-top: 20px; font-size: 11px; color: #64748b; line-height: 1.5; }
+    #countdown {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      font-size: 120px; font-weight: 800; color: #fff; text-shadow: 0 8px 40px rgba(0,0,0,.6);
+      z-index: 20; pointer-events: none; transition: opacity 0.2s;
+    }
+    #countdown.hidden { opacity: 0; }
+    #overlay {
+      position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+      background: rgba(10,15,24,0.85); z-index: 30;
+    }
+    #overlay.open { display: flex; }
+    #overlay .panel {
+      background: linear-gradient(145deg, #1e293b, #0f172a); border: 2px solid #475569;
+      border-radius: 16px; padding: 28px 36px; max-width: 420px; text-align: center;
+      box-shadow: 0 25px 80px rgba(0,0,0,.5);
+    }
+    #overlay h1 { color: #facc15; font-size: 28px; margin-bottom: 8px; }
+    #overlay p { color: #94a3b8; margin-bottom: 20px; }
+    #final-list { text-align: left; color: #e2e8f0; font-size: 15px; line-height: 1.9; }
+  </style>
+</head>
+<body>
+  <div id="countdown">3</div>
+  <div id="hud">
+    <h2>Time</h2>
+    <div id="timer">0:00.0</div>
+    <h2>Leaderboard</h2>
+    <div id="board"></div>
+    <div class="cam-hint">Press <strong>C</strong> to toggle camera: overview ↔ follow leader</div>
+  </div>
+  <div id="overlay">
+    <div class="panel">
+      <h1>Race Complete</h1>
+      <p>Final standings</p>
+      <div id="final-list"></div>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/cannon.js/0.6.2/cannon.min.js"></script>
+  <script>
+  (function () {
+    'use strict';
+
+    /* ========== Config ========== */
+    const MARBLE_RADIUS = 0.3;
+    const MARBLE_MASS = 1.2;
+    const TRACK_FRICTION = 0.06;
+    const MARBLE_FRICTION = 0.12;
+    const RESTITUTION = 0.4;
+    /** Gravity magnitude (tuned for ~60s full course). */
+    const GRAVITY_Y = -22;
+    const MARBLE_COLORS = [
+      { name: 'Red',    hex: 0xe74c3c },
+      { name: 'Blue',   hex: 0x3498db },
+      { name: 'Green',  hex: 0x2ecc71 },
+      { name: 'Yellow', hex: 0xf1c40f },
+      { name: 'Orange', hex: 0xe67e22 },
+      { name: 'Purple', hex: 0x9b59b6 },
+      { name: 'Pink',   hex: 0xff69b4 },
+      { name: 'Cyan',   hex: 0x1abc9c },
+    ];
+
+    /* ========== Track path (centerline) — long winding descent ========== */
+    /**
+     * Builds waypoints: cumulative distance along a procedural winding downhill.
+     * z is primary forward axis; x wiggles for turns; y drops with arc length.
+     */
+    function buildPathSamples() {
+      const samples = [];
+      const totalLen = 280;
+      const steps = 140;
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const s = t * totalLen;
+        // Wind left/right with multiple frequencies for banked-feel curves
+        const x =
+          Math.sin(t * Math.PI * 3.2) * 10 +
+          Math.sin(t * Math.PI * 7 + 1) * 4;
+        const z = t * 220 - 20;
+        const y = 48 - s * 0.16 + Math.sin(t * Math.PI * 4) * 1.2;
+        // Track half-width varies: wide overtaking section mid-run, funnel near end of first third
+        let halfW = 3.2;
+        if (t > 0.22 && t < 0.3) halfW = 1.35; // funnel / bunching
+        if (t > 0.45 && t < 0.62) halfW = 5.4; // wide spread / overtakes
+        if (t > 0.78) halfW = 2.4;
+        const bank = Math.cos(t * Math.PI * 3.2) * 0.42; // radians, modest banking
+        samples.push({ x, y, z, halfW, bank, s, t });
+      }
+      return samples;
+    }
+
+    const pathSamples = buildPathSamples();
+
+    function getPathTangentAtIndex(i) {
+      const a = pathSamples[Math.max(0, Math.min(pathSamples.length - 2, i))];
+      const b = pathSamples[Math.min(pathSamples.length - 1, i + 1)];
+      const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+      const len = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+      return { x: dx / len, y: dy / len, z: dz / len, len };
+    }
+
+    /* ========== Three.js setup ========== */
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x6b9bd1);
+    scene.fog = new THREE.Fog(0x87ceeb, 120, 320);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 500);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const hemi = new THREE.HemisphereLight(0xb8d4ff, 0x3d2914, 0.55);
+    scene.add(hemi);
+    const sun = new THREE.DirectionalLight(0xfff5e6, 0.95);
+    sun.position.set(40, 80, 30);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.camera.near = 1;
+    sun.shadow.camera.far = 280;
+    sun.shadow.camera.left = -80;
+    sun.shadow.camera.right = 80;
+    sun.shadow.camera.top = 80;
+    sun.shadow.camera.bottom = -80;
+    scene.add(sun);
+
+    /* Wooden-ish track material */
+    const woodTex = makeWoodTexture();
+    const trackMat = new THREE.MeshStandardMaterial({
+      map: woodTex,
+      roughness: 0.75,
+      metalness: 0.05,
+      color: 0xd4a574,
+    });
+    const railMat = new THREE.MeshStandardMaterial({ color: 0x5c4033, roughness: 0.9 });
+
+    function makeWoodTexture() {
+      const c = document.createElement('canvas');
+      c.width = 256; c.height = 256;
+      const g = c.getContext('2d');
+      g.fillStyle = '#c9a06c';
+      g.fillRect(0, 0, 256, 256);
+      for (let i = 0; i < 80; i++) {
+        g.strokeStyle = `rgba(100,60,30,${0.05 + Math.random() * 0.08})`;
+        g.beginPath();
+        g.moveTo(Math.random() * 256, 0);
+        g.lineTo(Math.random() * 256 + 20, 256);
+        g.stroke();
+      }
+      const tex = new THREE.CanvasTexture(c);
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+      return tex;
+    }
+
+    /* ========== Cannon world ========== */
+    const world = new CANNON.World();
+    world.gravity.set(0, GRAVITY_Y, 0);
+    world.broadphase = new CANNON.NaiveBroadphase();
+    world.solver.iterations = 14;
+    world.defaultContactMaterial.contactEquationStiffness = 1e7;
+    world.defaultContactMaterial.contactEquationRelaxation = 3;
+
+    const physMatGround = new CANNON.Material('ground');
+    const physMatMarble = new CANNON.Material('marble');
+    const physMatBumper = new CANNON.Material('bumper');
+    world.addContactMaterial(new CANNON.ContactMaterial(physMatGround, physMatMarble, {
+      friction: TRACK_FRICTION, restitution: RESTITUTION * 0.85,
+    }));
+    world.addContactMaterial(new CANNON.ContactMaterial(physMatMarble, physMatMarble, {
+      friction: MARBLE_FRICTION, restitution: RESTITUTION,
+    }));
+    world.addContactMaterial(new CANNON.ContactMaterial(physMatBumper, physMatMarble, {
+      friction: 0.05, restitution: 0.95,
+    }));
+
+    const staticBodies = [];
+    const dynamicObstacles = []; // { body, mesh?, update(dt) }
+
+    function addStaticBox(pos, halfExtents, quat, material) {
+      const shape = new CANNON.Box(new CANNON.Vec3(halfExtents.x, halfExtents.y, halfExtents.z));
+      const body = new CANNON.Body({ mass: 0, material: material ?? physMatGround });
+      body.position.copy(pos);
+      if (quat) body.quaternion.copy(quat);
+      body.addShape(shape);
+      world.addBody(body);
+      staticBodies.push(body);
+      return body;
+    }
+
+    /* Build track segments between samples */
+    const segmentLen = 2.2;
+    const marbles = [];
+    let finishZ = 0;
+    let finishX = 0;
+    let finishY = 0;
+
+    for (let i = 0; i < pathSamples.length - 1; i++) {
+      const p0 = pathSamples[i];
+      const p1 = pathSamples[i + 1];
+      const midx = (p0.x + p1.x) * 0.5;
+      const midy = (p0.y + p1.y) * 0.5;
+      const midz = (p0.z + p1.z) * 0.5;
+      const tan = getPathTangentAtIndex(i);
+      const len = tan.len * (p1.s - p0.s) / (pathSamples[1].s - pathSamples[0].s) * segmentLen * 0.45 + tan.len * 1.6;
+      // Forward in XZ, up is world Y
+      const fx = p1.x - p0.x, fz = p1.z - p0.z;
+      const flatLen = Math.sqrt(fx * fx + fz * fz) || 1;
+      const forward = new THREE.Vector3(fx / flatLen, 0, fz / flatLen);
+      const worldUp = new THREE.Vector3(0, 1, 0);
+      const right = new THREE.Vector3().crossVectors(forward, worldUp).normalize();
+      if (right.lengthSq() < 0.001) right.set(1, 0, 0);
+      const trueUp = new THREE.Vector3().crossVectors(right, forward).normalize();
+      // Apply bank: rotate right/trueUp around forward
+      const bank = (p0.bank + p1.bank) * 0.5;
+      const cosb = Math.cos(bank), sinb = Math.sin(bank);
+      const upB = new THREE.Vector3(
+        trueUp.x * cosb + right.x * sinb,
+        trueUp.y * cosb + right.y * sinb,
+        trueUp.z * cosb + right.z * sinb
+      );
+      const rightB = new THREE.Vector3().crossVectors(forward, upB).normalize();
+
+      const halfW = (p0.halfW + p1.halfW) * 0.5;
+      const thick = 0.35;
+      const segLen = Math.sqrt(
+        (p1.x - p0.x) ** 2 + (p1.y - p0.y) ** 2 + (p1.z - p0.z) ** 2
+      ) + 0.15;
+
+      // Floor (physics)
+      const floorHalf = new CANNON.Vec3(halfW * 0.95, thick * 0.5, segLen * 0.5);
+      const qThree = new THREE.Quaternion();
+      const m3 = new THREE.Matrix4();
+      m3.makeBasis(rightB, upB, forward.clone().negate());
+      qThree.setFromRotationMatrix(m3);
+      const qCan = new CANNON.Quaternion(qThree.x, qThree.y, qThree.z, qThree.w);
+
+      const pos = new CANNON.Vec3(midx, midy - MARBLE_RADIUS * 0.2, midz);
+      addStaticBox(pos, floorHalf, qCan, physMatGround);
+
+      // Floor mesh (visual, slightly offset)
+      const floorGeo = new THREE.BoxGeometry(halfW * 1.9, thick, segLen);
+      const floorMesh = new THREE.Mesh(floorGeo, trackMat);
+      floorMesh.castShadow = true;
+      floorMesh.receiveShadow = true;
+      floorMesh.position.set(midx, midy - MARBLE_RADIUS * 0.2, midz);
+      floorMesh.quaternion.copy(qThree);
+      if (trackMat.map) {
+        trackMat.map.repeat.set(halfW * 0.35, segLen * 0.12);
+      }
+      scene.add(floorMesh);
+
+      // Side walls (taller near funnel for “rails”)
+      const wallH = 1.1 + (halfW < 2 ? 0.6 : 0);
+      const wallT = 0.18;
+      const wallHalf = new CANNON.Vec3(wallT * 0.5, wallH * 0.5, segLen * 0.5);
+      const wallOffset = halfW + wallT * 0.5;
+
+      for (const sign of [-1, 1]) {
+        const ox = midx + rightB.x * wallOffset * sign;
+        const oy = midy + rightB.y * wallOffset * sign + wallH * 0.32;
+        const oz = midz + rightB.z * wallOffset * sign;
+        addStaticBox(new CANNON.Vec3(ox, oy, oz), wallHalf, qCan, physMatGround);
+        const wm = new THREE.Mesh(new THREE.BoxGeometry(wallT, wallH, segLen), railMat);
+        wm.position.set(ox, oy, oz);
+        wm.quaternion.copy(qThree);
+        wm.castShadow = true;
+        wm.receiveShadow = true;
+        scene.add(wm);
+      }
+
+      // Steep drop sections: extra downward bias in a few ranges (steeper local floor by offset)
+      if (i > 15 && i < 22) {
+        const dropBody = new CANNON.Body({ mass: 0, material: physMatGround });
+        dropBody.position.set(midx + upB.x * (-0.9), midy + upB.y * (-0.9) - 0.5, midz + upB.z * (-0.9));
+        dropBody.quaternion.copy(qCan);
+        dropBody.addShape(new CANNON.Box(new CANNON.Vec3(halfW * 0.85, 0.25, segLen * 0.55)));
+        world.addBody(dropBody);
+      }
+    }
+
+    const last = pathSamples[pathSamples.length - 1];
+    finishX = last.x;
+    finishY = last.y;
+    finishZ = last.z + 4;
+
+    const stripeMatW = new THREE.MeshStandardMaterial({ color: 0xffffff });
+    const stripeMatB = new THREE.MeshStandardMaterial({ color: 0x111111 });
+
+    /** Finish line Z: marbles crossing this plane (with X bounds) finish the race. */
+    const finishLineZ = finishZ;
+
+    /* ========== Obstacles (5 types) ========== */
+
+    // 1) Spinning bumpers — cylinders on the sides (~28% along path)
+    (function addSpinningBumpers() {
+      const idx = Math.floor(pathSamples.length * 0.28);
+      const p = pathSamples[idx];
+      const tan = getPathTangentAtIndex(idx);
+      const fx = pathSamples[idx + 1].x - p.x, fz = pathSamples[idx + 1].z - p.z;
+      const fl = Math.sqrt(fx * fx + fz * fz) || 1;
+      const forward = new THREE.Vector3(fx / fl, 0, fz / fl);
+      const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
+      for (let s = -1; s  <= 1; s += 2) {
+        const bx = p.x + right.x * (p.halfW * 0.5 * s);
+        const by = p.y + 0.55;
+        const bz = p.z + right.z * (p.halfW * 0.5 * s);
+        const r = 0.55, h = 0.35;
+        const shape = new CANNON.Cylinder(r, r, h, 12);
+        const body = new CANNON.Body({ mass: 0, material: physMatBumper });
+        body.type = CANNON.Body.KINEMATIC;
+        body.position.set(bx, by, bz);
+        const qShape = new CANNON.Quaternion();
+        qShape.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), Math.PI / 2);
+        body.addShape(shape, new CANNON.Vec3(0, 0, 0), qShape);
+        world.addBody(body);
+        const mesh = new THREE.Mesh(
+          new THREE.CylinderGeometry(r, r, h, 16),
+          new THREE.MeshStandardMaterial({ color: 0xf97316, metalness: 0.4, roughness: 0.4 })
+        );
+        mesh.position.set(bx, by, bz);
+        const qBase = new CANNON.Quaternion();
+        qBase.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), Math.PI / 2);
+        let spinAng = 0;
+        body.quaternion.copy(qBase);
+        mesh.quaternion.set(qBase.x, qBase.y, qBase.z, qBase.w);
+        scene.add(mesh);
+        dynamicObstacles.push({
+          body,
+          mesh,
+          update(dt) {
+            spinAng += s * 2.2 * dt;
+            const qSpin = new CANNON.Quaternion();
+            qSpin.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), spinAng);
+            qBase.mult(qSpin, body.quaternion);
+            mesh.quaternion.set(body.quaternion.x, body.quaternion.y, body.quaternion.z, body.quaternion.w);
+          },
+        });
+      }
+    })();
+
+    // 2) Jump ramps (~38%)
+    (function addJumpRamps() {
+      const idx = Math.floor(pathSamples.length * 0.38);
+      const p = pathSamples[idx];
+      const p1 = pathSamples[idx + 1];
+      const fx = p1.x - p.x, fz = p1.z - p.z;
+      const fl = Math.sqrt(fx * fx + fz * fz) || 1;
+      const forward = new THREE.Vector3(fx / fl, 0, fz / fl);
+      const qAxis = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)),
+        -0.42
+      );
+      const qCan = new CANNON.Quaternion(qAxis.x, qAxis.y, qAxis.z, qAxis.w);
+      const rampHalf = new CANNON.Vec3(2.2, 0.12, 1.8);
+      const pos = new CANNON.Vec3(p.x, p.y + 0.25, p.z);
+      addStaticBox(pos, rampHalf, qCan, physMatGround);
+      const rampMesh = new THREE.Mesh(
+        new THREE.BoxGeometry(rampHalf.x * 2, rampHalf.y * 2, rampHalf.z * 2),
+        new THREE.MeshStandardMaterial({ color: 0x94a3b8 })
+      );
+      rampMesh.position.set(pos.x, pos.y, pos.z);
+      rampMesh.quaternion.copy(qAxis);
+      scene.add(rampMesh);
+    })();
+
+    // 3) Zigzag pegs — pachinko field (~50%)
+    (function addPegField() {
+      const i0 = Math.floor(pathSamples.length * 0.48);
+      const i1 = Math.floor(pathSamples.length * 0.54);
+      for (let i = i0; i < i1; i += 2) {
+        const p = pathSamples[i];
+        for (let row = -2; row <= 2; row++) {
+          const zig = ((i + row) % 4) * 0.45;
+          const peg = new CANNON.Body({ mass: 0, material: physMatGround });
+          peg.addShape(new CANNON.Sphere(0.22));
+          peg.position.set(p.x + zig, p.y + 0.6, p.z + row * 1.1);
+          world.addBody(peg);
+          const m = new THREE.Mesh(
+            new THREE.SphereGeometry(0.22, 12, 12),
+            new THREE.MeshStandardMaterial({ color: 0xfde047 })
+          );
+          m.position.copy(peg.position);
+          scene.add(m);
+        }
+      }
+    })();
+
+    // 4) Swinging pendulums (~65%)
+    (function addPendulums() {
+      const idx = Math.floor(pathSamples.length * 0.65);
+      const p = pathSamples[idx];
+      const fx = pathSamples[idx + 1].x - p.x, fz = pathSamples[idx + 1].z - p.z;
+      const fl = Math.sqrt(fx * fx + fz * fz) || 1;
+      const forward = new THREE.Vector3(fx / fl, 0, fz / fl);
+      const anchorY = p.y + 3.2;
+      for (let o = -1; o <= 1; o += 2) {
+        const ax = p.x + o * 1.2;
+        const az = p.z;
+        const bobLen = 2.4;
+        const ballR = 0.45;
+        const b = new CANNON.Body({ mass: 0, material: physMatBumper });
+        b.type = CANNON.Body.KINEMATIC;
+        b.addShape(new CANNON.Sphere(ballR));
+        b.position.set(ax, anchorY - bobLen, az);
+        world.addBody(b);
+        const vis = new THREE.Mesh(
+          new THREE.SphereGeometry(ballR, 16, 16),
+          new THREE.MeshStandardMaterial({ color: 0x7c3aed, metalness: 0.3 })
+        );
+        vis.castShadow = true;
+        scene.add(vis);
+        const obs = {
+          body: b,
+          vis: vis,
+          phase: o * 0.7,
+          ax, az, anchorY, bobLen, o,
+          fwd: forward.clone(),
+          update(dt) {
+            this.phase += dt * 1.35 * this.o;
+            const swing = Math.sin(this.phase) * 1.15;
+            const bx = this.ax + this.fwd.x * swing * this.bobLen * 0.35;
+            const by = this.anchorY - this.bobLen * Math.cos(Math.sin(this.phase) * 0.55);
+            const bz = this.az + this.fwd.z * swing * this.bobLen * 0.35 + swing;
+            this.body.position.set(bx, by, bz);
+            this.body.velocity.set(0, 0, 0);
+            this.body.angularVelocity.set(0, 0, 0);
+            this.vis.position.set(bx, by, bz);
+          },
+        };
+        dynamicObstacles.push(obs);
+      }
+    })();
+
+    // 5) Narrow bridge — tight walls (already in path halfW; add extra bumpers on bridge ~72%)
+    (function narrowBridgeExtras() {
+      const i0 = Math.floor(pathSamples.length * 0.70);
+      const i1 = Math.floor(pathSamples.length * 0.76);
+      for (let i = i0; i < i1; i += 3) {
+        const p = pathSamples[i];
+        addStaticBox(
+          new CANNON.Vec3(p.x, p.y + 0.35, p.z),
+          new CANNON.Vec3(0.12, 0.25, 1.2),
+          null,
+          physMatGround
+        );
+      }
+    })();
+
+    /* Ground plane far below */
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(400, 400),
+      new THREE.MeshStandardMaterial({ color: 0x355c3d, roughness: 1 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -15;
+    ground.receiveShadow = true;
+    scene.add(ground);
+    const gBody = new CANNON.Body({ mass: 0, material: physMatGround });
+    gBody.addShape(new CANNON.Plane());
+    gBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+    gBody.position.set(0, -15, 0);
+    world.addBody(gBody);
+
+    /* ========== Marbles ========== */
+    const start = pathSamples[0];
+    const startTan = getPathTangentAtIndex(0);
+    const sfx = pathSamples[1].x - start.x, sfz = pathSamples[1].z - start.z;
+    const sfl = Math.sqrt(sfx * sfx + sfz * sfz) || 1;
+    const startForward = new THREE.Vector3(sfx / sfl, 0, sfz / sfl);
+    const startRight = new THREE.Vector3().crossVectors(startForward, new THREE.Vector3(0, 1, 0)).normalize();
+
+    for (let i = 0; i < 8; i++) {
+      const col = MARBLE_COLORS[i];
+      const spread = (i - 3.5) * (MARBLE_RADIUS * 2.15);
+      const ox = start.x + startRight.x * spread * 0.95;
+      const oy = start.y + MARBLE_RADIUS * 1.8;
+      const oz = start.z + startRight.z * spread * 0.95;
+
+      const shape = new CANNON.Sphere(MARBLE_RADIUS);
+      const body = new CANNON.Body({
+        mass: MARBLE_MASS,
+        material: physMatMarble,
+        linearDamping: 0.02,
+        angularDamping: 0.08,
+      });
+      body.position.set(ox, oy, oz);
+      body.addShape(shape);
+      // slight random push so separation diverges
+      const rv = () => (Math.random() - 0.5) * 0.8;
+      body.velocity.set(rv(), -0.2 + Math.random() * 0.15, rv() + 1.2 + Math.random() * 0.4);
+      body.angularVelocity.set(rv() * 2, rv() * 2, rv() * 2);
+      world.addBody(body);
+
+      const mat = new THREE.MeshStandardMaterial({
+        color: col.hex,
+        emissive: col.hex,
+        emissiveIntensity: 0.35,
+        metalness: 0.2,
+        roughness: 0.35,
+      });
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(MARBLE_RADIUS, 24, 24), mat);
+      mesh.castShadow = true;
+      mesh.position.copy(body.position);
+      scene.add(mesh);
+
+      marbles.push({
+        body,
+        mesh,
+        name: col.name,
+        colorHex: '#' + ((col.hex >>> 0) & 0xffffff).toString(16).padStart(6, '0'),
+        finished: false,
+        finishTime: null,
+        place: null,
+      });
+    }
+
+    /* Finish line: striped deck + poles + banner */
+    const fg = new THREE.Group();
+    for (let b = -5; b <= 5; b++) {
+      const st = new THREE.Mesh(
+        new THREE.BoxGeometry(0.55, 0.12, 7.5),
+        Math.abs(b) % 2 === 0 ? stripeMatW : stripeMatB
+      );
+      st.position.set(finishX + b * 0.55, finishY + 0.05, finishZ);
+      fg.add(st);
+    }
+    const pole1 = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 8), new THREE.MeshStandardMaterial({ color: 0x64748b }));
+    pole1.position.set(finishX - 4, finishY + 4, finishZ);
+    const pole2 = pole1.clone();
+    pole2.position.set(finishX + 4, finishY + 4, finishZ);
+    const banner = new THREE.Mesh(
+      new THREE.PlaneGeometry(8, 1.2),
+      new THREE.MeshStandardMaterial({ color: 0xdc2626, emissive: 0x450a0a, emissiveIntensity: 0.2, side: THREE.DoubleSide })
+    );
+    banner.position.set(finishX, finishY + 7.5, finishZ);
+    banner.rotation.y = Math.PI / 2;
+    fg.add(pole1, pole2, banner);
+    scene.add(fg);
+
+    /* ========== Race logic / HUD ========== */
+    let raceStarted = false;
+    let raceTime = 0;
+    let allFinished = false;
+    let camMode = 0; // 0 = overview, 1 = follow leader
+    const boardEl = document.getElementById('board');
+    const timerEl = document.getElementById('timer');
+    const cdEl = document.getElementById('countdown');
+    const overlayEl = document.getElementById('overlay');
+    const finalListEl = document.getElementById('final-list');
+
+    function progressAlongTrack(pos) {
+      // approximate: project to nearest sample by z then use arc length
+      let best = 0, bestD = Infinity;
+      for (let i = 0; i < pathSamples.length; i++) {
+        const p = pathSamples[i];
+        const d = (pos.x - p.x) ** 2 + (pos.z - p.z) ** 2;
+        if (d < bestD) { bestD = d; best = i; }
+      }
+      return pathSamples[best].s + (pos.z - pathSamples[best].z) * 0.08;
+    }
+
+    function sortMarblesByProgress() {
+      return [...marbles].sort((a, b) => {
+        if (a.finished && b.finished) return (a.place || 99) - (b.place || 99);
+        if (a.finished) return -1;
+        if (b.finished) return 1;
+        return progressAlongTrack(b.body.position) - progressAlongTrack(a.body.position);
+      });
+    }
+
+    let placeCounter = 0;
+    function updateLeaderboard() {
+      const sorted = sortMarblesByProgress();
+      boardEl.innerHTML = '';
+      sorted.forEach((m, idx) => {
+        const row = document.createElement('div');
+        row.className = 'row' + (m.finished ? ' done' : '');
+        const rank = document.createElement('span');
+        rank.className = 'rank';
+        rank.textContent = m.place != null ? m.place + '.' : (idx + 1) + '.';
+        const dot = document.createElement('span');
+        dot.className = 'dot';
+        dot.style.background = m.colorHex;
+        dot.style.color = m.colorHex;
+        const lab = document.createElement('span');
+        lab.textContent = m.name + (m.finished ? `  ${formatTime(m.finishTime)}` : '');
+        row.append(rank, dot, lab);
+        boardEl.appendChild(row);
+      });
+    }
+
+    function formatTime(sec) {
+      const m = Math.floor(sec / 60);
+      const s = sec - m * 60;
+      return m + ':' + (s < 10 ? '0' : '') + s.toFixed(2);
+    }
+
+    function updateTimerDisplay() {
+      timerEl.textContent = formatTime(raceTime);
+    }
+
+    /* Countdown: 3 → 2 → 1 → GO (page shows 3 immediately; race + physics start after GO) */
+    let cdStep = 0;
+    const cdInt = setInterval(() => {
+      cdStep++;
+      if (cdStep === 1) cdEl.textContent = '2';
+      else if (cdStep === 2) cdEl.textContent = '1';
+      else if (cdStep === 3) cdEl.textContent = 'GO!';
+      else {
+        clearInterval(cdInt);
+        setTimeout(() => {
+          cdEl.classList.add('hidden');
+          raceStarted = true;
+        }, 400);
+      }
+    }, 1000);
+
+    let lastT = performance.now();
+    function animate(now) {
+      requestAnimationFrame(animate);
+      const dt = Math.min(0.05, (now - lastT) / 1000);
+      lastT = now;
+
+      if (raceStarted && !allFinished) {
+        raceTime += dt;
+        updateTimerDisplay();
+      }
+
+      dynamicObstacles.forEach((o) => { if (o.update) o.update(dt); });
+
+      if (raceStarted) {
+        world.step(1 / 60, dt, 3);
+      }
+
+      marbles.forEach((m) => {
+        m.mesh.position.copy(m.body.position);
+        m.mesh.quaternion.copy(m.body.quaternion);
+      });
+
+      // finish check: cross plane at finishZ (with x tolerance)
+      if (raceStarted) {
+        marbles.forEach((m) => {
+          if (m.finished) return;
+          const p = m.body.position;
+          if (p.z >= finishLineZ - 0.5 && Math.abs(p.x - finishX) < 10) {
+            m.finished = true;
+            m.finishTime = raceTime;
+            m.place = ++placeCounter;
+            if (placeCounter >= 8) {
+              allFinished = true;
+              showRaceComplete();
+            }
+          }
+        });
+      }
+
+      updateLeaderboard();
+
+      // Camera
+      const sorted = sortMarblesByProgress();
+      const leader = sorted.find((x) => !x.finished) || sorted[0];
+
+      if (camMode === 0) {
+        camera.position.lerp(
+          new THREE.Vector3(start.x + 25, start.y + 55, start.z + 95),
+          0.04
+        );
+        camera.lookAt(finishX * 0.2, finishY - 5, finishZ * 0.5);
+      } else {
+        const lp = leader.body.position;
+        camera.position.lerp(new THREE.Vector3(lp.x - 8, lp.y + 10, lp.z + 14), 0.08);
+        camera.lookAt(lp.x, lp.y + MARBLE_RADIUS, lp.z);
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    function showRaceComplete() {
+      const ordered = [...marbles].sort((a, b) => (a.place || 99) - (b.place || 99));
+      finalListEl.innerHTML = ordered
+        .map((m) => `${m.place}. ${m.name} — ${formatTime(m.finishTime)}`)
+        .join('<br/>');
+      overlayEl.classList.add('open');
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'c' || e.key === 'C') {
+        camMode = 1 - camMode;
+      }
+    });
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateLeaderboard();
+    animate(lastT);
+  })();
+  </script>
+</body>
+</html>
