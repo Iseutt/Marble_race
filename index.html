@@ -67,12 +67,24 @@
     /* ========== Config ========== */
     const MARBLE_RADIUS = 0.3;
     const MARBLE_MASS = 0.9;
-    const TRACK_THICK = 0.55;
-    const TRACK_FRICTION = 0.045;
-    const MARBLE_FRICTION = 0.1;
-    const RESTITUTION = 0.5;
-    /** Gravity (tuned with track slope for ~45s typical finish). */
-    const GRAVITY_Y = -25;
+    const CHANNEL_HALF_W = 1.0; /* total groove width ~2 */
+    const FLOOR_THICK = 0.35;
+    const WALL_THICK = 0.22;
+    const WALL_H = 1.05;
+    const WALL_INWARD_TILT = 0.42; /* rad — walls lean in like a gutter */
+    const SEG_OVERLAP = 0.12; /* no gaps between Cannon boxes */
+    const ENCLOSED_DIST = 12; /* world units along path: roof + closed channel */
+    const MARBLE_FRICTION = 0.08;
+    const MARBLE_RESTITUTION = 0.42;
+    /** Floor / wall contact params (per spec). */
+    const FLOOR_FRICTION = 0.4;
+    const FLOOR_RESTITUTION = 0.3;
+    const WALL_FRICTION = 0.1;
+    const WALL_RESTITUTION = 0.6;
+    const GRAVITY_Y = -30;
+    const MIN_SPEED_NUDGE = 2;
+    const NUDGE_FORCE = 22;
+    const START_PUSH_SPEED = 8.5; /* strong forward kick along 3D tangent */
     /** Log marble body positions every frame when ?debug=1 is in the URL (very verbose). */
     const DEBUG_MARBLE_POS = /[?&]debug=1\b/.test(location.search);
     const MARBLE_COLORS = [
@@ -86,65 +98,128 @@
       { name: 'Cyan',   hex: 0x1abc9c },
     ];
 
-    /* ========== Track path (centerline) — long winding descent ========== */
     /**
-     * Builds waypoints: cumulative distance along a procedural winding downhill.
-     * z is primary forward axis; x wiggles for turns; y drops with arc length.
+     * Rebuilt course: steep “mountain” drop → banked left → steep chute → banked right → zigzag → finish straight.
+     * Large ΔY, sustained ~22–35° effective grades, short 45°+ kinks in steep zones.
      */
     function buildPathSamples() {
       const samples = [];
-      const totalLen = 280;
-      const steps = 140;
-      for (let i = 0; i <= steps; i++) {
-        const t = i / steps;
-        const s = t * totalLen;
-        // Wind left/right with multiple frequencies for banked-feel curves
-        const x =
-          Math.sin(t * Math.PI * 3.2) * 10 +
-          Math.sin(t * Math.PI * 7 + 1) * 4;
-        const z = t * 220 - 20;
-        const y = 48 - s * 0.21 + Math.sin(t * Math.PI * 4) * 1.2;
-        // Track half-width varies: wide overtaking section mid-run, funnel near end of first third
-        let halfW = 3.2;
-        if (t > 0.22 && t < 0.3) halfW = 1.35; // funnel / bunching
-        if (t > 0.45 && t < 0.62) halfW = 5.4; // wide spread / overtakes
-        if (t > 0.78) halfW = 2.4;
-        const bank = Math.cos(t * Math.PI * 3.2) * 0.42; // radians, modest banking
-        samples.push({ x, y, z, halfW, bank, s, t });
+      const STEPS = 170;
+      for (let i = 0; i <= STEPS; i++) {
+        const u = i / STEPS;
+        const z = u * 248 - 8;
+        let x = 0;
+        let y = 128;
+
+        if (u < 0.09) {
+          const k = u / 0.09;
+          y = 128 - k * 44;
+          x = 0;
+        } else if (u < 0.24) {
+          const k = (u - 0.09) / 0.15;
+          y = 84 - k * 26;
+          x = -Math.sin(k * Math.PI * 0.85) * 18;
+        } else if (u < 0.3) {
+          const k = (u - 0.24) / 0.06;
+          y = 58 - k * 24;
+          x = -18 + k * 5;
+        } else if (u < 0.44) {
+          const k = (u - 0.3) / 0.14;
+          y = 34 - k * 11;
+          x = -13 + Math.sin(k * Math.PI * 0.95) * 20;
+        } else if (u < 0.64) {
+          const k = (u - 0.44) / 0.2;
+          y = 23 - k * 8;
+          x = Math.sin(k * Math.PI * 5) * 5.5;
+        } else {
+          const k = (u - 0.64) / 0.36;
+          y = 15 - k * 10;
+          x = (1 - k) * Math.sin(0.64 * Math.PI * 5) * 5.5 * 0.25;
+        }
+
+        samples.push({ x, y, z, u });
+      }
+      /* Arc length + banking from horizontal curvature (centrifugal into track). */
+      let s = 0;
+      samples[0].s = 0;
+      for (let i = 1; i < samples.length; i++) {
+        const a = samples[i - 1];
+        const b = samples[i];
+        const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+        s += Math.sqrt(dx * dx + dy * dy + dz * dz);
+        samples[i].s = s;
+      }
+      const headings = [];
+      for (let i = 0; i < samples.length; i++) {
+        const i0 = Math.max(0, i - 1);
+        const i1 = Math.min(samples.length - 1, i + 1);
+        const p0 = samples[i0], p1 = samples[i1];
+        headings.push(Math.atan2(p1.x - p0.x, p1.z - p0.z));
+      }
+      for (let i = 0; i < samples.length; i++) {
+        const h0 = headings[Math.max(0, i - 1)];
+        const h1 = headings[Math.min(headings.length - 1, i + 1)];
+        let dh = h1 - h0;
+        while (dh > Math.PI) dh -= Math.PI * 2;
+        while (dh < -Math.PI) dh += Math.PI * 2;
+        samples[i].bank = Math.max(-0.62, Math.min(0.62, dh * 1.35));
       }
       return samples;
     }
 
     const pathSamples = buildPathSamples();
 
-    function getPathTangentAtIndex(i) {
-      const a = pathSamples[Math.max(0, Math.min(pathSamples.length - 2, i))];
-      const b = pathSamples[Math.min(pathSamples.length - 1, i + 1)];
+    /** Unit tangent at sample index (smooth). */
+    function getTangentAtSample(i) {
+      const i0 = Math.max(0, Math.min(pathSamples.length - 2, i));
+      const a = pathSamples[i0];
+      const b = pathSamples[Math.min(pathSamples.length - 1, i0 + 1)];
       const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
       const len = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
-      return { x: dx / len, y: dy / len, z: dz / len, len };
+      return new THREE.Vector3(dx / len, dy / len, dz / len);
     }
 
-    /** Orthonormal frame for segment pathSamples[i]→pathSamples[i+1]; `upB` is track “out of floor” for placing surfaces. */
+    /**
+     * Right-handed track frame: forward = 3D tangent, up ≈ sky from groove floor, right = lateral.
+     * Bank rotates (right, up) around forward so turns push marbles into the surface.
+     */
     function getTrackSegmentFrame(i) {
       const p0 = pathSamples[i];
       const p1 = pathSamples[i + 1];
-      const fx = p1.x - p0.x, fz = p1.z - p0.z;
-      const flatLen = Math.sqrt(fx * fx + fz * fz) || 1;
-      const forward = new THREE.Vector3(fx / flatLen, 0, fz / flatLen);
+      const forward = new THREE.Vector3(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z);
+      forward.normalize();
+      if (forward.lengthSq() < 1e-8) forward.set(0, -1, 0);
+
       const worldUp = new THREE.Vector3(0, 1, 0);
-      let right = new THREE.Vector3().crossVectors(forward, worldUp).normalize();
-      if (right.lengthSq() < 0.001) right.set(1, 0, 0);
-      const trueUp = new THREE.Vector3().crossVectors(right, forward).normalize();
+      let right = new THREE.Vector3().crossVectors(worldUp, forward).normalize();
+      if (right.lengthSq() < 1e-8) right.set(1, 0, 0);
+      let up = new THREE.Vector3().crossVectors(forward, right).normalize();
+
       const bank = (p0.bank + p1.bank) * 0.5;
       const cosb = Math.cos(bank), sinb = Math.sin(bank);
-      const upB = new THREE.Vector3(
-        trueUp.x * cosb + right.x * sinb,
-        trueUp.y * cosb + right.y * sinb,
-        trueUp.z * cosb + right.z * sinb
+      const rightB = new THREE.Vector3(
+        right.x * cosb - up.x * sinb,
+        right.y * cosb - up.y * sinb,
+        right.z * cosb - up.z * sinb
       ).normalize();
-      const rightB = new THREE.Vector3().crossVectors(forward, upB).normalize();
+      const upB = new THREE.Vector3().crossVectors(forward, rightB).normalize();
+
       return { p0, p1, forward, upB, rightB };
+    }
+
+    function nearestPathTangent(pos) {
+      let best = 0;
+      let bestD = Infinity;
+      const px = pos.x, py = pos.y, pz = pos.z;
+      for (let i = 0; i < pathSamples.length; i++) {
+        const p = pathSamples[i];
+        const d = (px - p.x) ** 2 + (py - p.y) ** 2 + (pz - p.z) ** 2;
+        if (d < bestD) {
+          bestD = d;
+          best = i;
+        }
+      }
+      return getTangentAtSample(Math.min(pathSamples.length - 2, best));
     }
 
     /* ========== Three.js setup ========== */
@@ -204,23 +279,31 @@
 
     /* ========== Cannon world ========== */
     const world = new CANNON.World();
-    world.gravity.set(0, GRAVITY_Y, 0); /* Issue 2: stronger pull (~ -25) */
+    world.gravity.set(0, GRAVITY_Y, 0);
     world.broadphase = new CANNON.NaiveBroadphase();
-    world.solver.iterations = 14;
+    world.solver.iterations = 18;
     world.defaultContactMaterial.contactEquationStiffness = 1e7;
     world.defaultContactMaterial.contactEquationRelaxation = 3;
 
-    const physMatGround = new CANNON.Material('ground');
+    const physMatFloor = new CANNON.Material('trackFloor');
+    const physMatWall = new CANNON.Material('trackWall');
     const physMatMarble = new CANNON.Material('marble');
     const physMatBumper = new CANNON.Material('bumper');
-    world.addContactMaterial(new CANNON.ContactMaterial(physMatGround, physMatMarble, {
-      friction: TRACK_FRICTION, restitution: RESTITUTION * 0.85,
+    const physMatGroundPlane = new CANNON.Material('groundPlane');
+    world.addContactMaterial(new CANNON.ContactMaterial(physMatFloor, physMatMarble, {
+      friction: FLOOR_FRICTION, restitution: FLOOR_RESTITUTION,
+    }));
+    world.addContactMaterial(new CANNON.ContactMaterial(physMatWall, physMatMarble, {
+      friction: WALL_FRICTION, restitution: WALL_RESTITUTION,
     }));
     world.addContactMaterial(new CANNON.ContactMaterial(physMatMarble, physMatMarble, {
-      friction: MARBLE_FRICTION, restitution: RESTITUTION,
+      friction: MARBLE_FRICTION, restitution: MARBLE_RESTITUTION,
     }));
     world.addContactMaterial(new CANNON.ContactMaterial(physMatBumper, physMatMarble, {
-      friction: 0.05, restitution: 0.95,
+      friction: 0.05, restitution: 0.92,
+    }));
+    world.addContactMaterial(new CANNON.ContactMaterial(physMatGroundPlane, physMatMarble, {
+      friction: 0.5, restitution: 0.15,
     }));
 
     const staticBodies = [];
@@ -228,7 +311,7 @@
 
     function addStaticBox(pos, halfExtents, quat, material) {
       const shape = new CANNON.Box(new CANNON.Vec3(halfExtents.x, halfExtents.y, halfExtents.z));
-      const body = new CANNON.Body({ mass: 0, material: material ?? physMatGround });
+      const body = new CANNON.Body({ mass: 0, material: material ?? physMatFloor });
       body.position.copy(pos);
       if (quat) body.quaternion.copy(quat);
       body.addShape(shape);
@@ -237,282 +320,144 @@
       return body;
     }
 
+    /** Maps Three quaternion to Cannon. */
+    function toCannonQuat(qT) {
+      return new CANNON.Quaternion(qT.x, qT.y, qT.z, qT.w);
+    }
+
     /* Build track segments between samples */
     const marbles = [];
 
+    /** Single-file line along -forward from path start, lifted into the groove. */
     function setMarbleSpawnTransform(body, slotIndex) {
-      const { forward, upB, rightB } = getTrackSegmentFrame(0);
+      const { forward, upB } = getTrackSegmentFrame(0);
       const p0 = pathSamples[0];
-      const spread = (slotIndex - 3.5) * (MARBLE_RADIUS * 2.12);
-      const lift = MARBLE_RADIUS + 0.22;
+      const spacing = 1.0;
+      const base = new THREE.Vector3(p0.x, p0.y, p0.z).sub(forward.clone().multiplyScalar(slotIndex * spacing));
+      const lift = MARBLE_RADIUS + FLOOR_THICK * 0.5 + 0.14;
       body.position.set(
-        p0.x + rightB.x * spread + upB.x * lift,
-        p0.y + rightB.y * spread + upB.y * lift,
-        p0.z + rightB.z * spread + upB.z * lift
+        base.x + upB.x * lift,
+        base.y + upB.y * lift,
+        base.z + upB.z * lift
       );
       body.velocity.set(0, 0, 0);
       body.angularVelocity.set(0, 0, 0);
       body.quaternion.set(0, 0, 0, 1);
     }
 
+    /** Identical forward push + small lateral jitter (±0.05). */
     function kickMarblesOnRaceStart() {
-      const { forward } = getTrackSegmentFrame(0);
+      const { forward, rightB } = getTrackSegmentFrame(0);
       marbles.forEach((m) => {
         m.body.wakeUp();
-        const rv = () => (Math.random() - 0.5) * 1.0;
-        const base = 3.8 + Math.random() * 1.6;
+        const lat = (Math.random() - 0.5) * 0.1;
         m.body.velocity.set(
-          forward.x * base + rv(),
-          -0.28 + Math.random() * 0.2,
-          forward.z * base + rv()
+          forward.x * START_PUSH_SPEED + rightB.x * lat,
+          forward.y * START_PUSH_SPEED + rightB.y * lat,
+          forward.z * START_PUSH_SPEED + rightB.z * lat
         );
-        m.body.angularVelocity.set(rv() * 4, rv() * 4, rv() * 4);
+        m.body.angularVelocity.set(0, 0, 0);
       });
     }
+
     let finishZ = 0;
     let finishX = 0;
     let finishY = 0;
+    const finishTanWorld = new THREE.Vector3();
 
+    /* U-channel: floor + inward-tilted walls (+ optional roof for enclosed start). */
     for (let i = 0; i < pathSamples.length - 1; i++) {
       const p0 = pathSamples[i];
       const p1 = pathSamples[i + 1];
-      const midx = (p0.x + p1.x) * 0.5;
-      const midy = (p0.y + p1.y) * 0.5;
-      const midz = (p0.z + p1.z) * 0.5;
       const { forward, upB, rightB } = getTrackSegmentFrame(i);
+      const mid = new THREE.Vector3((p0.x + p1.x) * 0.5, (p0.y + p1.y) * 0.5, (p0.z + p1.z) * 0.5);
+      const segLen =
+        Math.sqrt(
+          (p1.x - p0.x) ** 2 + (p1.y - p0.y) ** 2 + (p1.z - p0.z) ** 2
+        ) + SEG_OVERLAP;
 
-      const halfW = (p0.halfW + p1.halfW) * 0.5;
-      const thick = TRACK_THICK;
-      const segLen = Math.sqrt(
-        (p1.x - p0.x) ** 2 + (p1.y - p0.y) ** 2 + (p1.z - p0.z) ** 2
-      ) + 0.2;
-
-      // Floor (physics): center is below path midpoint along -upB so top of box sits on the running surface
-      const floorHalf = new CANNON.Vec3(halfW * 0.95, thick * 0.5, segLen * 0.5);
       const qThree = new THREE.Quaternion();
       const m3 = new THREE.Matrix4();
-      m3.makeBasis(rightB, upB, forward.clone().negate());
+      m3.makeBasis(rightB, upB, forward);
       qThree.setFromRotationMatrix(m3);
-      const qCan = new CANNON.Quaternion(qThree.x, qThree.y, qThree.z, qThree.w);
+      const qCan = toCannonQuat(qThree);
 
-      const surfH = thick * 0.5 + 0.02;
-      const pos = new CANNON.Vec3(
-        midx - upB.x * surfH,
-        midy - upB.y * surfH,
-        midz - upB.z * surfH
+      const floorCenter = mid.clone().sub(upB.clone().multiplyScalar(FLOOR_THICK * 0.5));
+      const floorHalf = new CANNON.Vec3(
+        CHANNEL_HALF_W * 0.98,
+        FLOOR_THICK * 0.5,
+        segLen * 0.5
       );
-      addStaticBox(pos, floorHalf, qCan, physMatGround);
+      addStaticBox(
+        new CANNON.Vec3(floorCenter.x, floorCenter.y, floorCenter.z),
+        floorHalf,
+        qCan,
+        physMatFloor
+      );
 
-      const floorGeo = new THREE.BoxGeometry(halfW * 1.9, thick, segLen);
-      const floorMesh = new THREE.Mesh(floorGeo, trackMat);
+      const floorMesh = new THREE.Mesh(
+        new THREE.BoxGeometry(CHANNEL_HALF_W * 1.96, FLOOR_THICK, segLen),
+        trackMat
+      );
       floorMesh.castShadow = true;
       floorMesh.receiveShadow = true;
-      floorMesh.position.set(pos.x, pos.y, pos.z);
+      floorMesh.position.copy(floorCenter);
       floorMesh.quaternion.copy(qThree);
       if (trackMat.map) {
-        trackMat.map.repeat.set(halfW * 0.35, segLen * 0.12);
+        trackMat.map.repeat.set(CHANNEL_HALF_W * 0.4, segLen * 0.1);
       }
       scene.add(floorMesh);
 
-      const wallH = 1.1 + (halfW < 2 ? 0.6 : 0);
-      const wallT = 0.18;
-      const wallHalf = new CANNON.Vec3(wallT * 0.5, wallH * 0.5, segLen * 0.5);
-      const wallOffset = halfW + wallT * 0.5;
-      const wallLift = upB.clone().multiplyScalar(wallH * 0.5 + MARBLE_RADIUS * 0.2);
+      const wallHalf = new CANNON.Vec3(WALL_THICK * 0.5, WALL_H * 0.5, segLen * 0.5);
+      const lateral = CHANNEL_HALF_W + WALL_THICK * 0.55;
+      const wallLift = FLOOR_THICK * 0.5 + WALL_H * 0.42;
 
       for (const sign of [-1, 1]) {
-        const ox = midx + rightB.x * wallOffset * sign + wallLift.x;
-        const oy = midy + rightB.y * wallOffset * sign + wallLift.y;
-        const oz = midz + rightB.z * wallOffset * sign + wallLift.z;
-        addStaticBox(new CANNON.Vec3(ox, oy, oz), wallHalf, qCan, physMatGround);
-        const wm = new THREE.Mesh(new THREE.BoxGeometry(wallT, wallH, segLen), railMat);
-        wm.position.set(ox, oy, oz);
-        wm.quaternion.copy(qThree);
+        const qTilt = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), sign * WALL_INWARD_TILT);
+        const qWall = qThree.clone().multiply(qTilt);
+        const wpos = mid.clone()
+          .add(rightB.clone().multiplyScalar(sign * lateral))
+          .add(upB.clone().multiplyScalar(wallLift));
+        addStaticBox(new CANNON.Vec3(wpos.x, wpos.y, wpos.z), wallHalf, toCannonQuat(qWall), physMatWall);
+        const wm = new THREE.Mesh(
+          new THREE.BoxGeometry(WALL_THICK, WALL_H, segLen),
+          railMat
+        );
+        wm.position.copy(wpos);
+        wm.quaternion.copy(qWall);
         wm.castShadow = true;
         wm.receiveShadow = true;
         scene.add(wm);
       }
 
-      if (i > 15 && i < 22) {
-        const dropBody = new CANNON.Body({ mass: 0, material: physMatGround });
-        dropBody.position.set(
-          pos.x - upB.x * 0.85,
-          pos.y - upB.y * 0.85 - 0.45,
-          pos.z - upB.z * 0.85
+      const midS = (p0.s + p1.s) * 0.5;
+      if (midS < ENCLOSED_DIST) {
+        const roofT = 0.22;
+        const roofHalf = new CANNON.Vec3(CHANNEL_HALF_W * 1.05, roofT * 0.5, segLen * 0.5);
+        const roofC = mid.clone().add(upB.clone().multiplyScalar(FLOOR_THICK + WALL_H + roofT * 0.5 + 0.12));
+        addStaticBox(new CANNON.Vec3(roofC.x, roofC.y, roofC.z), roofHalf, qCan, physMatWall);
+        const roofMesh = new THREE.Mesh(
+          new THREE.BoxGeometry(roofHalf.x * 2, roofT, segLen),
+          new THREE.MeshStandardMaterial({ color: 0x3d2e22, roughness: 0.9 })
         );
-        dropBody.quaternion.copy(qCan);
-        dropBody.addShape(new CANNON.Box(new CANNON.Vec3(halfW * 0.85, 0.32, segLen * 0.55)));
-        world.addBody(dropBody);
+        roofMesh.position.copy(roofC);
+        roofMesh.quaternion.copy(qThree);
+        scene.add(roofMesh);
       }
     }
 
     const last = pathSamples[pathSamples.length - 1];
-    finishX = last.x;
-    finishY = last.y;
-    finishZ = last.z + 4;
+    finishTanWorld.copy(getTangentAtSample(pathSamples.length - 2)).normalize();
+    finishX = last.x + finishTanWorld.x * 4;
+    finishY = last.y + finishTanWorld.y * 4;
+    finishZ = last.z + finishTanWorld.z * 4;
 
     const stripeMatW = new THREE.MeshStandardMaterial({ color: 0xffffff });
     const stripeMatB = new THREE.MeshStandardMaterial({ color: 0x111111 });
 
-    /** Finish line Z: marbles crossing this plane (with X bounds) finish the race. */
-    const finishLineZ = finishZ;
+    /* Finish plane: progress along `finishTanWorld` from `last` sample. */
 
-    /* ========== Obstacles (5 types) ========== */
-
-    // 1) Spinning bumpers — cylinders on the sides (~28% along path)
-    (function addSpinningBumpers() {
-      const idx = Math.floor(pathSamples.length * 0.28);
-      const p = pathSamples[idx];
-      const tan = getPathTangentAtIndex(idx);
-      const fx = pathSamples[idx + 1].x - p.x, fz = pathSamples[idx + 1].z - p.z;
-      const fl = Math.sqrt(fx * fx + fz * fz) || 1;
-      const forward = new THREE.Vector3(fx / fl, 0, fz / fl);
-      const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
-      for (let s = -1; s  <= 1; s += 2) {
-        const bx = p.x + right.x * (p.halfW * 0.5 * s);
-        const by = p.y + 0.55;
-        const bz = p.z + right.z * (p.halfW * 0.5 * s);
-        const r = 0.55, h = 0.35;
-        const shape = new CANNON.Cylinder(r, r, h, 12);
-        const body = new CANNON.Body({ mass: 0, material: physMatBumper });
-        body.type = CANNON.Body.KINEMATIC;
-        body.position.set(bx, by, bz);
-        const qShape = new CANNON.Quaternion();
-        qShape.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), Math.PI / 2);
-        body.addShape(shape, new CANNON.Vec3(0, 0, 0), qShape);
-        world.addBody(body);
-        const mesh = new THREE.Mesh(
-          new THREE.CylinderGeometry(r, r, h, 16),
-          new THREE.MeshStandardMaterial({ color: 0xf97316, metalness: 0.4, roughness: 0.4 })
-        );
-        mesh.position.set(bx, by, bz);
-        const qBase = new CANNON.Quaternion();
-        qBase.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), Math.PI / 2);
-        let spinAng = 0;
-        body.quaternion.copy(qBase);
-        mesh.quaternion.set(qBase.x, qBase.y, qBase.z, qBase.w);
-        scene.add(mesh);
-        dynamicObstacles.push({
-          body,
-          mesh,
-          update(dt) {
-            spinAng += s * 2.2 * dt;
-            const qSpin = new CANNON.Quaternion();
-            qSpin.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), spinAng);
-            qBase.mult(qSpin, body.quaternion);
-            mesh.quaternion.set(body.quaternion.x, body.quaternion.y, body.quaternion.z, body.quaternion.w);
-          },
-        });
-      }
-    })();
-
-    // 2) Jump ramps (~38%)
-    (function addJumpRamps() {
-      const idx = Math.floor(pathSamples.length * 0.38);
-      const p = pathSamples[idx];
-      const p1 = pathSamples[idx + 1];
-      const fx = p1.x - p.x, fz = p1.z - p.z;
-      const fl = Math.sqrt(fx * fx + fz * fz) || 1;
-      const forward = new THREE.Vector3(fx / fl, 0, fz / fl);
-      const qAxis = new THREE.Quaternion().setFromAxisAngle(
-        new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)),
-        -0.42
-      );
-      const qCan = new CANNON.Quaternion(qAxis.x, qAxis.y, qAxis.z, qAxis.w);
-      const rampHalf = new CANNON.Vec3(2.2, 0.12, 1.8);
-      const pos = new CANNON.Vec3(p.x, p.y + 0.25, p.z);
-      addStaticBox(pos, rampHalf, qCan, physMatGround);
-      const rampMesh = new THREE.Mesh(
-        new THREE.BoxGeometry(rampHalf.x * 2, rampHalf.y * 2, rampHalf.z * 2),
-        new THREE.MeshStandardMaterial({ color: 0x94a3b8 })
-      );
-      rampMesh.position.set(pos.x, pos.y, pos.z);
-      rampMesh.quaternion.copy(qAxis);
-      scene.add(rampMesh);
-    })();
-
-    // 3) Zigzag pegs — pachinko field (~50%)
-    (function addPegField() {
-      const i0 = Math.floor(pathSamples.length * 0.48);
-      const i1 = Math.floor(pathSamples.length * 0.54);
-      for (let i = i0; i < i1; i += 2) {
-        const p = pathSamples[i];
-        for (let row = -2; row <= 2; row++) {
-          const zig = ((i + row) % 4) * 0.45;
-          const peg = new CANNON.Body({ mass: 0, material: physMatGround });
-          peg.addShape(new CANNON.Sphere(0.22));
-          peg.position.set(p.x + zig, p.y + 0.6, p.z + row * 1.1);
-          world.addBody(peg);
-          const m = new THREE.Mesh(
-            new THREE.SphereGeometry(0.22, 12, 12),
-            new THREE.MeshStandardMaterial({ color: 0xfde047 })
-          );
-          m.position.copy(peg.position);
-          scene.add(m);
-        }
-      }
-    })();
-
-    // 4) Swinging pendulums (~65%)
-    (function addPendulums() {
-      const idx = Math.floor(pathSamples.length * 0.65);
-      const p = pathSamples[idx];
-      const fx = pathSamples[idx + 1].x - p.x, fz = pathSamples[idx + 1].z - p.z;
-      const fl = Math.sqrt(fx * fx + fz * fz) || 1;
-      const forward = new THREE.Vector3(fx / fl, 0, fz / fl);
-      const anchorY = p.y + 3.2;
-      for (let o = -1; o <= 1; o += 2) {
-        const ax = p.x + o * 1.2;
-        const az = p.z;
-        const bobLen = 2.4;
-        const ballR = 0.45;
-        const b = new CANNON.Body({ mass: 0, material: physMatBumper });
-        b.type = CANNON.Body.KINEMATIC;
-        b.addShape(new CANNON.Sphere(ballR));
-        b.position.set(ax, anchorY - bobLen, az);
-        world.addBody(b);
-        const vis = new THREE.Mesh(
-          new THREE.SphereGeometry(ballR, 16, 16),
-          new THREE.MeshStandardMaterial({ color: 0x7c3aed, metalness: 0.3 })
-        );
-        vis.castShadow = true;
-        scene.add(vis);
-        const obs = {
-          body: b,
-          vis: vis,
-          phase: o * 0.7,
-          ax, az, anchorY, bobLen, o,
-          fwd: forward.clone(),
-          update(dt) {
-            this.phase += dt * 1.35 * this.o;
-            const swing = Math.sin(this.phase) * 1.15;
-            const bx = this.ax + this.fwd.x * swing * this.bobLen * 0.35;
-            const by = this.anchorY - this.bobLen * Math.cos(Math.sin(this.phase) * 0.55);
-            const bz = this.az + this.fwd.z * swing * this.bobLen * 0.35 + swing;
-            this.body.position.set(bx, by, bz);
-            this.body.velocity.set(0, 0, 0);
-            this.body.angularVelocity.set(0, 0, 0);
-            this.vis.position.set(bx, by, bz);
-          },
-        };
-        dynamicObstacles.push(obs);
-      }
-    })();
-
-    // 5) Narrow bridge — tight walls (already in path halfW; add extra bumpers on bridge ~72%)
-    (function narrowBridgeExtras() {
-      const i0 = Math.floor(pathSamples.length * 0.70);
-      const i1 = Math.floor(pathSamples.length * 0.76);
-      for (let i = i0; i < i1; i += 3) {
-        const p = pathSamples[i];
-        addStaticBox(
-          new CANNON.Vec3(p.x, p.y + 0.35, p.z),
-          new CANNON.Vec3(0.12, 0.25, 1.2),
-          null,
-          physMatGround
-        );
-      }
-    })();
+    /* Extra obstacles omitted — narrow U-channel + roof needs a clear corridor. */
 
     /* Ground plane far below */
     const ground = new THREE.Mesh(
@@ -523,7 +468,7 @@
     ground.position.y = -15;
     ground.receiveShadow = true;
     scene.add(ground);
-    const gBody = new CANNON.Body({ mass: 0, material: physMatGround });
+    const gBody = new CANNON.Body({ mass: 0, material: physMatGroundPlane });
     gBody.addShape(new CANNON.Plane());
     gBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
     gBody.position.set(0, -15, 0);
@@ -531,9 +476,6 @@
 
     /* ========== Marbles ========== */
     const start = pathSamples[0];
-    const sfx = pathSamples[1].x - start.x, sfz = pathSamples[1].z - start.z;
-    const sfl = Math.sqrt(sfx * sfx + sfz * sfz) || 1;
-    const startForward = new THREE.Vector3(sfx / sfl, 0, sfz / sfl);
 
     for (let i = 0; i < 8; i++) {
       const col = MARBLE_COLORS[i];
@@ -541,8 +483,8 @@
       const body = new CANNON.Body({
         mass: MARBLE_MASS,
         material: physMatMarble,
-        linearDamping: 0.018,
-        angularDamping: 0.06,
+        linearDamping: 0.01,
+        angularDamping: 0.01,
         allowSleep: false,
       });
       body.addShape(shape);
@@ -608,14 +550,14 @@
     const finalListEl = document.getElementById('final-list');
 
     function progressAlongTrack(pos) {
-      // approximate: project to nearest sample by z then use arc length
       let best = 0, bestD = Infinity;
+      const px = pos.x, py = pos.y, pz = pos.z;
       for (let i = 0; i < pathSamples.length; i++) {
         const p = pathSamples[i];
-        const d = (pos.x - p.x) ** 2 + (pos.z - p.z) ** 2;
+        const d = (px - p.x) ** 2 + (py - p.y) ** 2 + (pz - p.z) ** 2;
         if (d < bestD) { bestD = d; best = i; }
       }
-      return pathSamples[best].s + (pos.z - pathSamples[best].z) * 0.08;
+      return pathSamples[best].s;
     }
 
     function sortMarblesByProgress() {
@@ -698,6 +640,16 @@
           kickMarblesOnRaceStart();
         }
         world.step(1 / 60, dt, 4);
+
+        marbles.forEach((m) => {
+          const v = m.body.velocity;
+          const sp = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+          if (sp < MIN_SPEED_NUDGE) {
+            const t = nearestPathTangent(m.body.position);
+            const f = NUDGE_FORCE * m.body.mass;
+            m.body.applyForce(new CANNON.Vec3(t.x * f, t.y * f, t.z * f), m.body.position);
+          }
+        });
       }
 
       marbles.forEach((m) => {
@@ -715,12 +667,16 @@
         console.log('[marble bodies]', parts.join(' | '));
       }
 
-      // finish check: cross plane at finishZ (with x tolerance)
       if (raceStarted) {
         marbles.forEach((m) => {
           if (m.finished) return;
           const p = m.body.position;
-          if (p.z >= finishLineZ - 0.5 && Math.abs(p.x - finishX) < 10) {
+          const dx = p.x - last.x, dy = p.y - last.y, dz = p.z - last.z;
+          const along =
+            dx * finishTanWorld.x + dy * finishTanWorld.y + dz * finishTanWorld.z;
+          const perp2 =
+            dx * dx + dy * dy + dz * dz - along * along;
+          if (along > 1.5 && perp2 < 64) {
             m.finished = true;
             m.finishTime = raceTime;
             m.place = ++placeCounter;
