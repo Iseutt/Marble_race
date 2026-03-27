@@ -66,12 +66,15 @@
 
     /* ========== Config ========== */
     const MARBLE_RADIUS = 0.3;
-    const MARBLE_MASS = 1.2;
-    const TRACK_FRICTION = 0.06;
-    const MARBLE_FRICTION = 0.12;
-    const RESTITUTION = 0.4;
-    /** Gravity magnitude (tuned for ~60s full course). */
-    const GRAVITY_Y = -22;
+    const MARBLE_MASS = 0.9;
+    const TRACK_THICK = 0.55;
+    const TRACK_FRICTION = 0.045;
+    const MARBLE_FRICTION = 0.1;
+    const RESTITUTION = 0.5;
+    /** Gravity (tuned with track slope for ~45s typical finish). */
+    const GRAVITY_Y = -25;
+    /** Log marble body positions every frame when ?debug=1 is in the URL (very verbose). */
+    const DEBUG_MARBLE_POS = /[?&]debug=1\b/.test(location.search);
     const MARBLE_COLORS = [
       { name: 'Red',    hex: 0xe74c3c },
       { name: 'Blue',   hex: 0x3498db },
@@ -100,7 +103,7 @@
           Math.sin(t * Math.PI * 3.2) * 10 +
           Math.sin(t * Math.PI * 7 + 1) * 4;
         const z = t * 220 - 20;
-        const y = 48 - s * 0.16 + Math.sin(t * Math.PI * 4) * 1.2;
+        const y = 48 - s * 0.21 + Math.sin(t * Math.PI * 4) * 1.2;
         // Track half-width varies: wide overtaking section mid-run, funnel near end of first third
         let halfW = 3.2;
         if (t > 0.22 && t < 0.3) halfW = 1.35; // funnel / bunching
@@ -120,6 +123,28 @@
       const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
       const len = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
       return { x: dx / len, y: dy / len, z: dz / len, len };
+    }
+
+    /** Orthonormal frame for segment pathSamples[i]→pathSamples[i+1]; `upB` is track “out of floor” for placing surfaces. */
+    function getTrackSegmentFrame(i) {
+      const p0 = pathSamples[i];
+      const p1 = pathSamples[i + 1];
+      const fx = p1.x - p0.x, fz = p1.z - p0.z;
+      const flatLen = Math.sqrt(fx * fx + fz * fz) || 1;
+      const forward = new THREE.Vector3(fx / flatLen, 0, fz / flatLen);
+      const worldUp = new THREE.Vector3(0, 1, 0);
+      let right = new THREE.Vector3().crossVectors(forward, worldUp).normalize();
+      if (right.lengthSq() < 0.001) right.set(1, 0, 0);
+      const trueUp = new THREE.Vector3().crossVectors(right, forward).normalize();
+      const bank = (p0.bank + p1.bank) * 0.5;
+      const cosb = Math.cos(bank), sinb = Math.sin(bank);
+      const upB = new THREE.Vector3(
+        trueUp.x * cosb + right.x * sinb,
+        trueUp.y * cosb + right.y * sinb,
+        trueUp.z * cosb + right.z * sinb
+      ).normalize();
+      const rightB = new THREE.Vector3().crossVectors(forward, upB).normalize();
+      return { p0, p1, forward, upB, rightB };
     }
 
     /* ========== Three.js setup ========== */
@@ -179,7 +204,7 @@
 
     /* ========== Cannon world ========== */
     const world = new CANNON.World();
-    world.gravity.set(0, GRAVITY_Y, 0);
+    world.gravity.set(0, GRAVITY_Y, 0); /* Issue 2: stronger pull (~ -25) */
     world.broadphase = new CANNON.NaiveBroadphase();
     world.solver.iterations = 14;
     world.defaultContactMaterial.contactEquationStiffness = 1e7;
@@ -213,8 +238,37 @@
     }
 
     /* Build track segments between samples */
-    const segmentLen = 2.2;
     const marbles = [];
+
+    function setMarbleSpawnTransform(body, slotIndex) {
+      const { forward, upB, rightB } = getTrackSegmentFrame(0);
+      const p0 = pathSamples[0];
+      const spread = (slotIndex - 3.5) * (MARBLE_RADIUS * 2.12);
+      const lift = MARBLE_RADIUS + 0.22;
+      body.position.set(
+        p0.x + rightB.x * spread + upB.x * lift,
+        p0.y + rightB.y * spread + upB.y * lift,
+        p0.z + rightB.z * spread + upB.z * lift
+      );
+      body.velocity.set(0, 0, 0);
+      body.angularVelocity.set(0, 0, 0);
+      body.quaternion.set(0, 0, 0, 1);
+    }
+
+    function kickMarblesOnRaceStart() {
+      const { forward } = getTrackSegmentFrame(0);
+      marbles.forEach((m) => {
+        m.body.wakeUp();
+        const rv = () => (Math.random() - 0.5) * 1.0;
+        const base = 3.8 + Math.random() * 1.6;
+        m.body.velocity.set(
+          forward.x * base + rv(),
+          -0.28 + Math.random() * 0.2,
+          forward.z * base + rv()
+        );
+        m.body.angularVelocity.set(rv() * 4, rv() * 4, rv() * 4);
+      });
+    }
     let finishZ = 0;
     let finishX = 0;
     let finishY = 0;
@@ -225,33 +279,15 @@
       const midx = (p0.x + p1.x) * 0.5;
       const midy = (p0.y + p1.y) * 0.5;
       const midz = (p0.z + p1.z) * 0.5;
-      const tan = getPathTangentAtIndex(i);
-      const len = tan.len * (p1.s - p0.s) / (pathSamples[1].s - pathSamples[0].s) * segmentLen * 0.45 + tan.len * 1.6;
-      // Forward in XZ, up is world Y
-      const fx = p1.x - p0.x, fz = p1.z - p0.z;
-      const flatLen = Math.sqrt(fx * fx + fz * fz) || 1;
-      const forward = new THREE.Vector3(fx / flatLen, 0, fz / flatLen);
-      const worldUp = new THREE.Vector3(0, 1, 0);
-      const right = new THREE.Vector3().crossVectors(forward, worldUp).normalize();
-      if (right.lengthSq() < 0.001) right.set(1, 0, 0);
-      const trueUp = new THREE.Vector3().crossVectors(right, forward).normalize();
-      // Apply bank: rotate right/trueUp around forward
-      const bank = (p0.bank + p1.bank) * 0.5;
-      const cosb = Math.cos(bank), sinb = Math.sin(bank);
-      const upB = new THREE.Vector3(
-        trueUp.x * cosb + right.x * sinb,
-        trueUp.y * cosb + right.y * sinb,
-        trueUp.z * cosb + right.z * sinb
-      );
-      const rightB = new THREE.Vector3().crossVectors(forward, upB).normalize();
+      const { forward, upB, rightB } = getTrackSegmentFrame(i);
 
       const halfW = (p0.halfW + p1.halfW) * 0.5;
-      const thick = 0.35;
+      const thick = TRACK_THICK;
       const segLen = Math.sqrt(
         (p1.x - p0.x) ** 2 + (p1.y - p0.y) ** 2 + (p1.z - p0.z) ** 2
-      ) + 0.15;
+      ) + 0.2;
 
-      // Floor (physics)
+      // Floor (physics): center is below path midpoint along -upB so top of box sits on the running surface
       const floorHalf = new CANNON.Vec3(halfW * 0.95, thick * 0.5, segLen * 0.5);
       const qThree = new THREE.Quaternion();
       const m3 = new THREE.Matrix4();
@@ -259,31 +295,35 @@
       qThree.setFromRotationMatrix(m3);
       const qCan = new CANNON.Quaternion(qThree.x, qThree.y, qThree.z, qThree.w);
 
-      const pos = new CANNON.Vec3(midx, midy - MARBLE_RADIUS * 0.2, midz);
+      const surfH = thick * 0.5 + 0.02;
+      const pos = new CANNON.Vec3(
+        midx - upB.x * surfH,
+        midy - upB.y * surfH,
+        midz - upB.z * surfH
+      );
       addStaticBox(pos, floorHalf, qCan, physMatGround);
 
-      // Floor mesh (visual, slightly offset)
       const floorGeo = new THREE.BoxGeometry(halfW * 1.9, thick, segLen);
       const floorMesh = new THREE.Mesh(floorGeo, trackMat);
       floorMesh.castShadow = true;
       floorMesh.receiveShadow = true;
-      floorMesh.position.set(midx, midy - MARBLE_RADIUS * 0.2, midz);
+      floorMesh.position.set(pos.x, pos.y, pos.z);
       floorMesh.quaternion.copy(qThree);
       if (trackMat.map) {
         trackMat.map.repeat.set(halfW * 0.35, segLen * 0.12);
       }
       scene.add(floorMesh);
 
-      // Side walls (taller near funnel for “rails”)
       const wallH = 1.1 + (halfW < 2 ? 0.6 : 0);
       const wallT = 0.18;
       const wallHalf = new CANNON.Vec3(wallT * 0.5, wallH * 0.5, segLen * 0.5);
       const wallOffset = halfW + wallT * 0.5;
+      const wallLift = upB.clone().multiplyScalar(wallH * 0.5 + MARBLE_RADIUS * 0.2);
 
       for (const sign of [-1, 1]) {
-        const ox = midx + rightB.x * wallOffset * sign;
-        const oy = midy + rightB.y * wallOffset * sign + wallH * 0.32;
-        const oz = midz + rightB.z * wallOffset * sign;
+        const ox = midx + rightB.x * wallOffset * sign + wallLift.x;
+        const oy = midy + rightB.y * wallOffset * sign + wallLift.y;
+        const oz = midz + rightB.z * wallOffset * sign + wallLift.z;
         addStaticBox(new CANNON.Vec3(ox, oy, oz), wallHalf, qCan, physMatGround);
         const wm = new THREE.Mesh(new THREE.BoxGeometry(wallT, wallH, segLen), railMat);
         wm.position.set(ox, oy, oz);
@@ -293,12 +333,15 @@
         scene.add(wm);
       }
 
-      // Steep drop sections: extra downward bias in a few ranges (steeper local floor by offset)
       if (i > 15 && i < 22) {
         const dropBody = new CANNON.Body({ mass: 0, material: physMatGround });
-        dropBody.position.set(midx + upB.x * (-0.9), midy + upB.y * (-0.9) - 0.5, midz + upB.z * (-0.9));
+        dropBody.position.set(
+          pos.x - upB.x * 0.85,
+          pos.y - upB.y * 0.85 - 0.45,
+          pos.z - upB.z * 0.85
+        );
         dropBody.quaternion.copy(qCan);
-        dropBody.addShape(new CANNON.Box(new CANNON.Vec3(halfW * 0.85, 0.25, segLen * 0.55)));
+        dropBody.addShape(new CANNON.Box(new CANNON.Vec3(halfW * 0.85, 0.32, segLen * 0.55)));
         world.addBody(dropBody);
       }
     }
@@ -488,32 +531,22 @@
 
     /* ========== Marbles ========== */
     const start = pathSamples[0];
-    const startTan = getPathTangentAtIndex(0);
     const sfx = pathSamples[1].x - start.x, sfz = pathSamples[1].z - start.z;
     const sfl = Math.sqrt(sfx * sfx + sfz * sfz) || 1;
     const startForward = new THREE.Vector3(sfx / sfl, 0, sfz / sfl);
-    const startRight = new THREE.Vector3().crossVectors(startForward, new THREE.Vector3(0, 1, 0)).normalize();
 
     for (let i = 0; i < 8; i++) {
       const col = MARBLE_COLORS[i];
-      const spread = (i - 3.5) * (MARBLE_RADIUS * 2.15);
-      const ox = start.x + startRight.x * spread * 0.95;
-      const oy = start.y + MARBLE_RADIUS * 1.8;
-      const oz = start.z + startRight.z * spread * 0.95;
-
       const shape = new CANNON.Sphere(MARBLE_RADIUS);
       const body = new CANNON.Body({
         mass: MARBLE_MASS,
         material: physMatMarble,
-        linearDamping: 0.02,
-        angularDamping: 0.08,
+        linearDamping: 0.018,
+        angularDamping: 0.06,
+        allowSleep: false,
       });
-      body.position.set(ox, oy, oz);
       body.addShape(shape);
-      // slight random push so separation diverges
-      const rv = () => (Math.random() - 0.5) * 0.8;
-      body.velocity.set(rv(), -0.2 + Math.random() * 0.15, rv() + 1.2 + Math.random() * 0.4);
-      body.angularVelocity.set(rv() * 2, rv() * 2, rv() * 2);
+      setMarbleSpawnTransform(body, i);
       world.addBody(body);
 
       const mat = new THREE.MeshStandardMaterial({
@@ -525,7 +558,8 @@
       });
       const mesh = new THREE.Mesh(new THREE.SphereGeometry(MARBLE_RADIUS, 24, 24), mat);
       mesh.castShadow = true;
-      mesh.position.copy(body.position);
+      mesh.position.set(body.position.x, body.position.y, body.position.z);
+      mesh.quaternion.set(body.quaternion.x, body.quaternion.y, body.quaternion.z, body.quaternion.w);
       scene.add(mesh);
 
       marbles.push({
@@ -641,6 +675,7 @@
     }, 1000);
 
     let lastT = performance.now();
+    let racePhysicsPrimed = false;
     function animate(now) {
       requestAnimationFrame(animate);
       const dt = Math.min(0.05, (now - lastT) / 1000);
@@ -654,13 +689,31 @@
       dynamicObstacles.forEach((o) => { if (o.update) o.update(dt); });
 
       if (raceStarted) {
-        world.step(1 / 60, dt, 3);
+        if (!racePhysicsPrimed) {
+          racePhysicsPrimed = true;
+          marbles.forEach((m, i) => {
+            setMarbleSpawnTransform(m.body, i);
+            m.body.wakeUp();
+          });
+          kickMarblesOnRaceStart();
+        }
+        world.step(1 / 60, dt, 4);
       }
 
       marbles.forEach((m) => {
-        m.mesh.position.copy(m.body.position);
-        m.mesh.quaternion.copy(m.body.quaternion);
+        const bp = m.body.position;
+        m.mesh.position.set(bp.x, bp.y, bp.z);
+        const bq = m.body.quaternion;
+        m.mesh.quaternion.set(bq.x, bq.y, bq.z, bq.w);
       });
+
+      if (DEBUG_MARBLE_POS && raceStarted) {
+        const parts = marbles.map((m, j) => {
+          const p = m.body.position;
+          return `${j}:${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}`;
+        });
+        console.log('[marble bodies]', parts.join(' | '));
+      }
 
       // finish check: cross plane at finishZ (with x tolerance)
       if (raceStarted) {
